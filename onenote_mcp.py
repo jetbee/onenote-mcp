@@ -5,10 +5,11 @@ OneNote content including embedded images and diagrams.
 """
 
 import json
+import xml.etree.ElementTree as ET
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from onenote_lib import com_client
+from onenote_lib import com_client, markdown_writer, write_gate
 from onenote_lib.config import config
 from onenote_lib.image_handler import get_all_images, get_image_base64
 from onenote_lib.vision import describe_image, describe_images
@@ -299,51 +300,141 @@ async def onenote_describe_image(
     ]
 
 
-# ── Write Tool ───────────────────────────────────────────────────────
+# ── Write Tools (only registered when writing is enabled) ────────────
 
 
-@mcp.tool()
-def onenote_create_page(section_id: str, title: str, content_html: str = "") -> str:
-    """Create a new page in a section.
+def _page_markdown(page_id: str) -> tuple[str, str, str]:
+    """Return (page_xml, markdown, last_modified) for a page."""
+    page_xml = com_client.get_page_content(page_id)
+    markdown, _ = parse_page_to_markdown(page_xml)
+    root = ET.fromstring(page_xml)
+    return page_xml, markdown, root.get("lastModifiedTime", "")
 
-    Args:
-        section_id: The section's OneNote ID where the page will be created
-        title: Page title
-        content_html: Optional HTML content for the page body.
-            Use simple HTML: <p>, <b>, <i>, <ul>/<li>, <table>, <h1>-<h6>.
-            Leave empty for a blank page.
-    """
-    ns = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+
+def _sharing_note(page_id: str) -> str:
+    """Describe whether the page lives in a notebook shared with other people."""
     try:
-        new_page_id = com_client.create_new_page(section_id)
+        object_id = page_id
+        for _ in range(5):
+            parent = com_client.get_hierarchy_parent(object_id)
+            if not parent or parent == object_id:
+                break
+            object_id = parent
+        notebooks = parse_notebooks(com_client.get_hierarchy("", com_client.NOTEBOOKS))
+        for nb in notebooks:
+            if nb.id == object_id:
+                path = (nb.path or "").lower()
+                if "sharepoint.com" in path:
+                    return (
+                        f"SHARED notebook {nb.name!r} (SharePoint). Edits sync to "
+                        "everyone this notebook is shared with."
+                    )
+                return f"Personal notebook {nb.name!r}."
+    except Exception:  # noqa: BLE001 - advisory only, never block the diff
+        pass
+    return "Could not determine which notebook this page belongs to."
 
-        if content_html or title:
-            import xml.etree.ElementTree as ET
+
+def _register_write_tools() -> None:
+    @mcp.tool()
+    def onenote_create_page(section_id: str, title: str, markdown: str = "") -> str:
+        """Create a new page in a section.
+
+        Args:
+            section_id: The section's OneNote ID where the page will be created
+            title: Page title
+            markdown: Optional page body as markdown. Headings, bullet and
+                numbered lists, bold, italic and links are carried across.
+        """
+        try:
+            new_page_id = com_client.create_new_page(section_id)
             page_xml = com_client.get_page_content(new_page_id)
-            root = ET.fromstring(page_xml)
-            ns_map = {"one": ns}
+            page_xml = markdown_writer.set_page_title(page_xml, title)
+            if markdown:
+                page_xml = markdown_writer.apply_markdown(page_xml, markdown, "append")
+            com_client.update_page_content(page_xml)
+            return json.dumps({"status": "created", "page_id": new_page_id, "title": title})
+        except Exception as exc:  # noqa: BLE001 - surface to the model
+            return json.dumps({"error": str(exc)})
 
-            title_elem = root.find(".//one:Title//one:T", ns_map)
-            if title_elem is not None:
-                title_elem.text = title
+    @mcp.tool()
+    def onenote_diff_page(page_id: str, markdown: str, mode: str = "append") -> str:
+        """Preview a page edit and get the confirm_token needed to apply it.
 
-            if content_html:
-                outline = ET.SubElement(root, f"{{{ns}}}Outline")
-                oe_children = ET.SubElement(outline, f"{{{ns}}}OEChildren")
-                oe = ET.SubElement(oe_children, f"{{{ns}}}OE")
-                t = ET.SubElement(oe, f"{{{ns}}}T")
-                t.text = content_html
+        Read-only. Show the returned diff to the user and get their agreement
+        before calling onenote_update_page.
 
-            updated_xml = ET.tostring(root, encoding="unicode", xml_declaration=True)
-            com_client.update_page_content(updated_xml)
+        Args:
+            page_id: The page's OneNote ID
+            markdown: The markdown to add, or to replace the page body with
+            mode: "append" adds to the end of the page; "replace" discards the
+                page's existing body, including images and ink
+        """
+        if mode not in ("append", "replace"):
+            return json.dumps({"error": f"mode must be 'append' or 'replace', got {mode!r}"})
+
+        page_xml, before, _ = _page_markdown(page_id)
+        updated_xml = markdown_writer.apply_markdown(page_xml, markdown, mode)
+        after, _ = parse_page_to_markdown(updated_xml)
 
         return json.dumps({
-            "status": "created",
-            "page_id": new_page_id,
-            "title": title,
+            "page_id": page_id,
+            "mode": mode,
+            "sharing": _sharing_note(page_id),
+            "diff": write_gate.render_diff(before, after, page_id),
+            "confirm_token": write_gate.issue_token(page_id, markdown, mode),
+            "note": "Show this diff to the user. Only call onenote_update_page "
+                    "once they have agreed to it.",
+        }, indent=2)
+
+    @mcp.tool()
+    def onenote_update_page(
+        page_id: str,
+        markdown: str,
+        confirm_token: str,
+        mode: str = "append",
+        force: bool = False,
+    ) -> str:
+        """Apply an edit previewed with onenote_diff_page.
+
+        Args:
+            page_id: The page's OneNote ID
+            markdown: Must match exactly what was passed to onenote_diff_page
+            confirm_token: The token returned by onenote_diff_page
+            mode: Must match the mode passed to onenote_diff_page
+            force: Apply even if the page changed since the diff, discarding
+                the other edit. Leave false unless the user asks for it.
+        """
+        try:
+            write_gate.consume_token(confirm_token, page_id, markdown, mode)
+        except PermissionError as exc:
+            return json.dumps({"error": str(exc)})
+
+        page_xml, _, last_modified = _page_markdown(page_id)
+        backup_path = write_gate.backup_page(page_id, page_xml)
+        updated_xml = markdown_writer.apply_markdown(page_xml, markdown, mode)
+
+        try:
+            com_client.update_page_content(
+                updated_xml,
+                expected_last_modified=None if force else last_modified,
+                force=force,
+            )
+        except com_client.PageConflictError as exc:
+            return json.dumps({"error": str(exc), "backup": str(backup_path)})
+        except Exception as exc:  # noqa: BLE001 - surface to the model, don't crash the server
+            return json.dumps({"error": str(exc), "backup": str(backup_path)})
+
+        return json.dumps({
+            "status": "updated",
+            "page_id": page_id,
+            "mode": mode,
+            "backup": str(backup_path),
         })
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+
+
+if config.enable_write:
+    _register_write_tools()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

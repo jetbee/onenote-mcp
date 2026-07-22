@@ -102,9 +102,38 @@ $xml | Out-File -FilePath $outFile -Encoding UTF8 -NoNewline
     return _run_ps_to_file(script)
 
 
-def update_page_content(xml_content: str) -> None:
-    """Update/create page content."""
-    # Write XML to temp file to avoid quoting issues
+class PageConflictError(RuntimeError):
+    """The page changed in OneNote since it was read."""
+
+
+def update_page_content(
+    xml_content: str,
+    expected_last_modified: str | None = None,
+    force: bool = False,
+) -> None:
+    """Update page content.
+
+    Args:
+        xml_content: The one:Page XML to apply.
+        expected_last_modified: The page's lastModifiedTime as read. OneNote
+            refuses the write if the page has changed since — which matters for
+            notebooks shared through SharePoint, where someone else may be
+            editing. Pass None to skip the check.
+        force: Overwrite even if the page changed. Discards the other edit.
+
+    Raises:
+        PageConflictError: The page was modified after it was read.
+    """
+    if expected_last_modified:
+        # OneNote returns ISO-8601 UTC (e.g. 2024-11-20T05:32:20.000Z).
+        date_expr = (
+            f"[DateTime]::Parse('{expected_last_modified}', "
+            "[Globalization.CultureInfo]::InvariantCulture, "
+            "[Globalization.DateTimeStyles]::AdjustToUniversal)"
+        )
+    else:
+        date_expr = "[DateTime]::MinValue"
+
     tmp = tempfile.mktemp(suffix=".xml")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -112,9 +141,18 @@ def update_page_content(xml_content: str) -> None:
         script = f"""
 $onenote = New-Object -ComObject OneNote.Application
 $xml = Get-Content -Path '{tmp}' -Raw -Encoding UTF8
-$onenote.UpdatePageContent($xml)
+$onenote.UpdatePageContent($xml, {date_expr}, 2, ${str(force).lower()})
 """
-        _run_ps(script)
+        try:
+            _run_ps(script)
+        except RuntimeError as exc:
+            # hrPageDoesNotExist / last-modified mismatch surface as 0x80042010.
+            if "80042010" in str(exc):
+                raise PageConflictError(
+                    "The page was modified in OneNote after it was read. "
+                    "Re-read the page, rebuild the change, and try again."
+                ) from exc
+            raise
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -128,6 +166,18 @@ $onenote = New-Object -ComObject OneNote.Application
 $pageId = ""
 $onenote.CreateNewPage('{safe_id}', [ref]$pageId, 0)
 $pageId
+"""
+    return _run_ps(script).strip()
+
+
+def get_hierarchy_parent(object_id: str) -> str:
+    """Return the ID of an object's parent (page -> section -> ... -> notebook)."""
+    safe_id = object_id.replace("'", "''")
+    script = f"""
+$onenote = New-Object -ComObject OneNote.Application
+$parentId = ""
+$onenote.GetHierarchyParent('{safe_id}', [ref]$parentId)
+$parentId
 """
     return _run_ps(script).strip()
 
