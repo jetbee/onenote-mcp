@@ -1,4 +1,7 @@
-mcp[cli]>=1.0.0
+# Upper bound is for Windows on ARM64: mcp >= 1.20 requires pyjwt[crypto],
+# which pulls in cryptography, and cryptography publishes no win_arm64 wheels
+# (it then tries to build from Rust source and fails).
+mcp[cli]>=1.12,<1.20
 pydantic>=2.0.0
 pydantic-settings>=2.5.0
 Pillow>=10.0.0
